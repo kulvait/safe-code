@@ -302,6 +302,62 @@ the host network namespace. A read/write project or mount lets Claude Code
 change those files. This is lightweight filesystem isolation, not a complete
 security boundary or protection for sensitive data.
 
+### Persistent links and project-relative mounts (both launchers)
+
+Use `--link-ro HOST_PATH TARGET` or `--link-rw HOST_PATH TARGET` to create a
+persistent symlink inside the selected project and expose the source at its
+canonical absolute host path inside Bubblewrap:
+
+```bash
+./safe-opencode --rw --link-ro /data/reference reference /path/to/project -- --standalone
+./safe-claudecode --rw --link-rw /data/results results /path/to/project
+```
+
+For example, `/path/to/project/reference` points to `/data/reference` on the
+host, and `/workspace/reference` resolves to the same mounted path in the
+sandbox. `HOST_PATH` must be an existing directory separate from the project;
+source symlinks are resolved before mounting. `TARGET` must be project-relative
+and its parent directory must already exist inside the project. An existing
+target is accepted only if it is a symlink resolving to the same source.
+Files, directories, dangling symlinks, and links to other sources are never
+replaced. Multiple links can share a source with the same access mode.
+
+**Both link switches require `--rw`**, even when reusing an existing correct
+symlink. **These links persist on the host**, including with `--dry-run`;
+creating them requires host write permission on their parent directories.
+The `ro`/`rw` choice applies only inside the sandbox, not when following the
+link on the host. Source paths that conflict with built-in sandbox mounts
+(such as `/usr` or `/tmp`) are rejected.
+
+For a sandbox-only mapping without creating a host symlink, supply a relative
+destination to the existing `--mount-ro` or `--mount-rw` option:
+
+```bash
+mkdir -p /path/to/project/reference /path/to/project/results
+./safe-opencode --rw \
+  --mount-ro /data/reference=./reference \
+  --mount-rw /data/results=./results \
+  /path/to/project -- --standalone
+```
+
+This mounts at `/workspace/reference` and `/workspace/results`, respectively.
+Relative destinations are relative to `PROJECT_DIR`, not the caller's current
+directory, and must stay inside the project. Mountpoint directories must already
+exist and their paths must not contain symlinks. No host files or directories are
+created or replaced by these mappings; existing contents are hidden only inside
+the sandbox. Both read-only and read/write mounts below `/workspace` require
+`--rw`, including absolute destinations such as `/workspace/reference`.
+With the default read-only project, both link switches and all mounts below
+`/workspace` are rejected before creating links or starting Bubblewrap.
+
+Absolute destinations continue to work, for example
+`--mount-ro /data/reference=/reference`. Named destinations must not overlap
+one another or replace built-in sandbox mounts; existing directories below
+`/workspace` are the exception to the built-in-path restriction.
+Use `=./mydata` for a project-relative mount, not `=~/mydata`: `~` is shell
+home-directory syntax, not a working-directory marker, and the launcher does
+not expand it.
+
 ## Limitations
 
 - Bubblewrap is Linux-only; this script does not support macOS or Windows.
