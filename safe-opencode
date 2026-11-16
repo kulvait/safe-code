@@ -15,6 +15,9 @@ RW_PATHS=()
 #Target mount points in the sandbox
 RO_TARGETS=()
 RW_TARGETS=()
+LINK_PATHS=()
+LINK_TARGETS=()
+LINK_MODES=()
 EXTRA_PATHS=()
 LIBRARY_PATHS=()
 DEVICE_PATHS=()
@@ -29,6 +32,8 @@ Options:
   --rw                    Mount the project read/write (default: read-only)
   --mount-ro HOST_PATH[=SANDBOX_PATH] Add a read-only host directory at SANDBOX_PATH (default: /mnt/host-ro/N)
   --mount-rw HOST_PATH[=SANDBOX_PATH] Add a read/write host directory at SANDBOX_PATH (default: /mnt/host-rw/N)
+  --link-ro HOST_PATH TARGET Persist a project symlink and mount HOST_PATH read-only at its real host path
+  --link-rw HOST_PATH TARGET Persist a project symlink and mount HOST_PATH read/write at its real host path
   --path PATH             Prepend a sandbox directory to PATH
   --library-path PATH     Prepend a sandbox directory to LD_LIBRARY_PATH
   --device PATH           Expose a host device under /dev
@@ -43,9 +48,13 @@ Options:
   --help, -h              Show this help
 
 Mount sources must be existing directories. Without DEST, mounts use numbered
-paths under /mnt/host-ro or /mnt/host-rw. DEST must be an absolute sandbox
-directory other than /. Named destinations cannot replace built-in sandbox
-mounts. Do not mount / or other broad, sensitive directories.
+paths under /mnt/host-ro or /mnt/host-rw. Relative mount destinations are under
+/workspace and require existing project directories without symlinks.
+Absolute destinations must not replace built-in sandbox mounts.
+Link TARGET is relative to PROJECT_DIR, with an existing parent directory.
+Existing targets must be symlinks resolving to HOST_PATH; nothing is replaced.
+Links persist on the host even when the project is mounted read-only.
+Do not mount / or other broad, sensitive directories.
 Note that --standalone provides isolation of the server, opencode creates a new session, and the sandbox is destroyed when the session ends.
 Without --standalone, if there is running OpenCode service, the sandbox will connect to it and use its session which may not be isolated from the host. Use --standalone to ensure isolation.
 
@@ -68,8 +77,8 @@ read_mount_spec() {
         MOUNT_SOURCE="${spec%%=*}"
         MOUNT_TARGET="${spec#*=}"
 
-        if [[ -z "$MOUNT_SOURCE" || -z "$MOUNT_TARGET" || "$MOUNT_TARGET" != /* ]]; then
-            echo "Error: named mount must be HOST_PATH=/absolute/sandbox/path: $spec" >&2
+        if [[ -z "$MOUNT_SOURCE" || -z "$MOUNT_TARGET" ]]; then
+            echo "Error: named mount must be HOST_PATH=SANDBOX_PATH: $spec" >&2
             exit 2
         fi
     fi
@@ -84,6 +93,16 @@ while [[ $# -gt 0 ]]; do
         --rw)
             MODE="rw"
             shift
+            ;;
+        --link-ro|--link-rw)
+            [[ $# -ge 3 && -n "$2" && -n "$3" && "$2" != --* && "$3" != --* ]] || {
+                echo "Error: $1 requires HOST_PATH and TARGET" >&2
+                exit 2
+            }
+            LINK_MODES+=("${1#--link-}")
+            LINK_PATHS+=("$2")
+            LINK_TARGETS+=("$3")
+            shift 3
             ;;
         --mount-ro|--mount-rw|--python-env|--config-dir|--data-dir|--bwrap|--path|--library-path)
             option="$1"
@@ -164,6 +183,83 @@ if [[ ! -d "$PROJECT" || "$PROJECT" == "/" ]]; then
     exit 1
 fi
 
+check_link_target() {
+    local source="$1" target="$2"
+    if [[ -e "$target" || -L "$target" ]]; then
+        if [[ ! -L "$target" ]] || [[ "$(realpath -e -- "$target")" != "$source" ]]; then
+            printf 'Error: link target exists but is not a symlink to %s: %s\n' "$source" "$target" >&2
+            exit 1
+        fi
+    fi
+}
+
+for i in "${!LINK_PATHS[@]}"; do
+    source="$(realpath -e -- "${LINK_PATHS[$i]}")"
+    if [[ ! -d "$source" || "$source" == / || "$source" == "$PROJECT" || "$source" == "$PROJECT/"* || "$PROJECT" == "$source/"* ]]; then
+        printf 'Error: link source must be a directory separate from the project: %s\n' "$source" >&2
+        exit 1
+    fi
+    target="${LINK_TARGETS[$i]}"
+    if [[ "$target" == /* ]]; then
+        printf 'Error: link target must be project-relative: %s\n' "$target" >&2
+        exit 2
+    fi
+    target="$(realpath -ms -- "$PROJECT/$target")"
+    parent="$(realpath -e -- "$(dirname -- "$target")")"
+    if [[ "$target" != "$PROJECT/"* || ! -d "$parent" || ( "$parent" != "$PROJECT" && "$parent" != "$PROJECT/"* ) ]]; then
+        printf 'Error: link target must have an existing parent inside the project: %s\n' "$target" >&2
+        exit 1
+    fi
+    target="$parent/$(basename -- "$target")"
+    check_link_target "$source" "$target"
+    for previous in "${!LINK_TARGETS[@]}"; do
+        [[ "$previous" -lt "$i" ]] || break
+        if [[ "$target" == "${LINK_TARGETS[$previous]}" && "$source" != "${LINK_PATHS[$previous]}" ]]; then
+            printf 'Error: conflicting link target: %s\n' "$target" >&2
+            exit 1
+        fi
+    done
+    LINK_PATHS[$i]="$source"
+    LINK_TARGETS[$i]="$target"
+    # Multiple links to the same source need only one mount per mode.
+    duplicate=0
+    for previous in "${!LINK_PATHS[@]}"; do
+        [[ "$previous" -lt "$i" ]] || break
+        if [[ "$source" == "${LINK_PATHS[$previous]}" && "${LINK_MODES[$i]}" == "${LINK_MODES[$previous]}" ]]; then
+            duplicate=1
+        fi
+    done
+    [[ "$duplicate" == 0 ]] || continue
+    if [[ "${LINK_MODES[$i]}" == ro ]]; then
+        RO_PATHS+=("$source")
+        RO_TARGETS+=("$source")
+    else
+        RW_PATHS+=("$source")
+        RW_TARGETS+=("$source")
+    fi
+done
+
+normalize_mount_target() {
+    local target="$1"
+    if [[ "$target" != /* ]]; then
+        target="$(realpath -ms -- "/workspace/$target")"
+        if [[ "$target" != /workspace/* ]]; then
+            printf 'Error: relative mount destination must stay inside the project: %s\n' "$1" >&2
+            exit 1
+        fi
+    else
+        target="$(realpath -ms -- "$target")"
+    fi
+    if [[ "$target" == /workspace/* ]]; then
+        local host_target="$PROJECT/${target#/workspace/}"
+        if [[ ! -d "$host_target" || "$(realpath -e -- "$host_target")" != "$host_target" ]]; then
+            printf 'Error: project mount destination must be an existing directory without symlinks: %s\n' "$host_target" >&2
+            exit 1
+        fi
+    fi
+    printf '%s\n' "$target"
+}
+
 for i in "${!RO_PATHS[@]}"; do
     RO_PATHS[$i]="$(realpath -e "${RO_PATHS[$i]}")"
     if [[ ! -d "${RO_PATHS[$i]}" || "${RO_PATHS[$i]}" == "/" ]]; then
@@ -171,7 +267,7 @@ for i in "${!RO_PATHS[@]}"; do
         exit 1
     fi
     if [[ -n "${RO_TARGETS[$i]}" ]]; then
-        RO_TARGETS[$i]="$(realpath -m "${RO_TARGETS[$i]}")"
+        RO_TARGETS[$i]="$(normalize_mount_target "${RO_TARGETS[$i]}")"
     fi
 done
 
@@ -182,7 +278,7 @@ for i in "${!RW_PATHS[@]}"; do
         exit 1
     fi
     if [[ -n "${RW_TARGETS[$i]}" ]]; then
-        RW_TARGETS[$i]="$(realpath -m "${RW_TARGETS[$i]}")"
+        RW_TARGETS[$i]="$(normalize_mount_target "${RW_TARGETS[$i]}")"
     fi
 done
 
@@ -195,14 +291,15 @@ for target in "${RO_TARGETS[@]}" "${RW_TARGETS[@]}"; do
         exit 1
     fi
     for reserved in "${RESERVED_MOUNTS[@]}"; do
+        [[ "$reserved" == /workspace && "$target" == /workspace/* ]] && continue
         if [[ "$target" == "$reserved" || "$target" == "$reserved/"* || "$reserved" == "$target/"* ]]; then
             printf 'Error: named mount destination conflicts with built-in sandbox path %s: %s\n' "$reserved" "$target" >&2
             exit 1
         fi
     done
     for existing in "${NAMED_TARGETS[@]}"; do
-        if [[ "$target" == "$existing" ]]; then
-            printf 'Error: duplicate named mount destination: %s\n' "$target" >&2
+        if [[ "$target" == "$existing" || "$target" == "$existing/"* || "$existing" == "$target/"* ]]; then
+            printf 'Error: duplicate or overlapping named mount destination: %s\n' "$target" >&2
             exit 1
         fi
     done
@@ -434,6 +531,16 @@ bypass Bubblewrap filesystem isolation. Add "-- --standalone" to keep the
 OpenCode server inside the sandbox.
 EOF
 fi
+
+for i in "${!LINK_PATHS[@]}"; do
+    check_link_target "${LINK_PATHS[$i]}" "${LINK_TARGETS[$i]}"
+done
+for i in "${!LINK_PATHS[@]}"; do
+    if [[ ! -L "${LINK_TARGETS[$i]}" ]]; then
+        ln -sT -- "${LINK_PATHS[$i]}" "${LINK_TARGETS[$i]}"
+    fi
+    printf 'Persistent link: %s -> %s\n' "${LINK_TARGETS[$i]}" "${LINK_PATHS[$i]}"
+done
 
 echo "Project: $PROJECT ($MODE)"
 for i in "${!RO_PATHS[@]}"; do
