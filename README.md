@@ -358,6 +358,13 @@ Use `=./mydata` for a project-relative mount, not `=~/mydata`: `~` is shell
 home-directory syntax, not a working-directory marker, and the launcher does
 not expand it.
 
+## Testing
+
+Run test scripts
+```
+python3 -m unittest discover -s tests -v
+```
+
 ## Limitations
 
 - Bubblewrap is Linux-only; this script does not support macOS or Windows.

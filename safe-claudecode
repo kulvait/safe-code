@@ -241,17 +241,47 @@ normalize_mount_target() {
     else
         target="$(realpath -ms -- "$target")"
     fi
+	# Do not allow mounting directly onto /workspace, which would hide the project directory.
+	if [[ "$target" == /workspace ]]; then
+	    echo "Error: cannot mount directly onto /workspace" >&2
+	    exit 1
+	fi
     if [[ "$target" == /workspace/* ]]; then
         if [[ "$MODE" != rw ]]; then
             echo "Error: mounts below /workspace require --rw for the project" >&2
             exit 2
         fi
         local host_target="$PROJECT/${target#/workspace/}"
+		local host_parent
+		host_parent="$(dirname -- "$host_target")"
+		# Disallow nested mounts without an existing parent directory.
+		if [[ ! -d "$host_parent" ]]; then
+		    printf 'Error: project mount destination parent must already be a directory: %s\n' \
+		        "$host_parent" >&2
+		    exit 1
+		fi
         if [[ "$(realpath -m -- "$host_target")" != "$host_target" ||
               ( -e "$host_target" && ! -d "$host_target" ) ]]; then
             printf 'Error: project mount destination must be a directory path without symlinks: %s\n' "$host_target" >&2
             exit 1
         fi
+		# Mounting onto an existing directory is allowed, but the directory must be empty and accessible.
+		if [[ -d "$host_target" ]]; then
+		    if [[ ! -r "$host_target" || ! -x "$host_target" ]]; then
+		        printf 'Error: cannot inspect project mount destination: %s\n' \
+		            "$host_target" >&2
+		        exit 1
+		    fi
+		    if ! (
+		        shopt -s nullglob dotglob
+		        entries=("$host_target"/*)
+		        [[ "${#entries[@]}" -eq 0 ]]
+		    ); then
+		        printf 'Error: project mount destination must be empty: %s\n' \
+		            "$host_target" >&2
+		        exit 1
+		    fi
+		fi
     fi
     printf '%s\n' "$target"
 }
@@ -490,6 +520,7 @@ ARGS+=(
     --setenv CLAUDE_CONFIG_DIR /sandbox-config/claude
     --setenv XDG_CONFIG_HOME /sandbox-config
     --setenv XDG_CACHE_HOME /tmp/cache
+    --setenv CLAUDE_CODE_DISABLE_AGENT_VIEW 1
     --setenv TMPDIR /tmp
     --setenv PATH "$PATH_VALUE"
     --chdir /workspace
