@@ -262,8 +262,9 @@ normalize_mount_target() {
             exit 2
         fi
         local host_target="$PROJECT/${target#/workspace/}"
-        if [[ ! -d "$host_target" || "$(realpath -e -- "$host_target")" != "$host_target" ]]; then
-            printf 'Error: project mount destination must be an existing directory without symlinks: %s\n' "$host_target" >&2
+        if [[ "$(realpath -m -- "$host_target")" != "$host_target" ||
+              ( -e "$host_target" && ! -d "$host_target" ) ]]; then
+            printf 'Error: project mount destination must be a directory path without symlinks: %s\n' "$host_target" >&2
             exit 1
         fi
     fi
