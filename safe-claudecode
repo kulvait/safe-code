@@ -1,0 +1,430 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+MODE="ro"
+RESUME=""
+PROJECT=""
+CONFIG="${SAFE_CLAUDECODE_CONFIG:-$HOME/.claude}"
+BWRAP="${SAFE_CLAUDECODE_BWRAP:-bwrap}"
+CLAUDE_BIN="${SAFE_CLAUDECODE_BIN:-}"
+EXTRA_PATHS=()
+LIBRARY_PATHS=()
+DEVICE_PATHS=()
+PYTHON_ENV=""
+RO_PATHS=()
+RW_PATHS=()
+RO_TARGETS=()
+RW_TARGETS=()
+DRY_RUN=0
+
+usage() {
+    cat <<'EOF'
+Usage:
+  safe-claudecode [OPTIONS] [PROJECT_DIR] [-- CLAUDE_ARGS...]
+
+Options:
+  --rw                    Mount the project read/write (default: read-only)
+  --mount-ro HOST_PATH[=SANDBOX_PATH] Add a read-only host directory at SANDBOX_PATH (default: /mnt/host-ro/N)
+  --mount-rw HOST_PATH[=SANDBOX_PATH] Add a read/write host directory at SANDBOX_PATH (default: /mnt/host-rw/N)
+  --path PATH             Prepend a sandbox directory to PATH
+  --library-path PATH     Prepend a sandbox directory to LD_LIBRARY_PATH
+  --device PATH           Expose a host device under /dev
+  --python-env PATH       Expose a Python environment read-only
+  --config-dir PATH       Use a different host Claude Code config directory
+  --bwrap PATH            Use a specific Bubblewrap executable
+  --resume                Continue the most recent session
+  --resume ID             Resume a specific session
+  --dry-run               Open an interactive shell in the sandbox without starting Claude Code
+  --help, -h              Show this help
+
+Mount sources must be existing directories. Without DEST, mounts use numbered
+paths under /mnt/host-ro or /mnt/host-rw. DEST must be an absolute sandbox
+directory other than /. Named destinations cannot replace built-in sandbox
+mounts. Do not mount / or other broad, sensitive directories.
+
+Examples:
+  safe-claudecode .
+  safe-claudecode --rw .
+  safe-claudecode --mount-ro /data/reference --mount-rw /data/output .
+  safe-claudecode --mount-ro /opt/vendor/lib=/opt/vendor/lib --library-path /opt/vendor/lib .
+  safe-claudecode --rw . -- --resume
+EOF
+}
+
+read_mount_spec() {
+    local spec="$1"
+    MOUNT_SOURCE="$spec"
+    MOUNT_TARGET=""
+
+    if [[ "$spec" == *=* ]]; then
+        MOUNT_SOURCE="${spec%%=*}"
+        MOUNT_TARGET="${spec#*=}"
+        if [[ -z "$MOUNT_SOURCE" || -z "$MOUNT_TARGET" || "$MOUNT_TARGET" != /* ]]; then
+            echo "Error: named mount must be HOST_PATH=/absolute/sandbox/path: $spec" >&2
+            exit 2
+        fi
+    fi
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --help|-h)
+            usage
+            exit 0
+            ;;
+        --rw)
+            MODE="rw"
+            shift
+            ;;
+        --mount-ro|--mount-rw|--python-env|--config-dir|--bwrap|--path|--library-path)
+            option="$1"
+            [[ $# -ge 2 && -n "$2" ]] || {
+                echo "Error: $option requires a path" >&2
+                exit 2
+            }
+            case "$option" in
+                --mount-ro)
+                    read_mount_spec "$2"
+                    RO_PATHS+=("$MOUNT_SOURCE")
+                    RO_TARGETS+=("$MOUNT_TARGET")
+                    ;;
+                --mount-rw)
+                    read_mount_spec "$2"
+                    RW_PATHS+=("$MOUNT_SOURCE")
+                    RW_TARGETS+=("$MOUNT_TARGET")
+                    ;;
+                --python-env) PYTHON_ENV="$2" ;;
+                --config-dir) CONFIG="$2" ;;
+                --bwrap) BWRAP="$2" ;;
+                --path) EXTRA_PATHS+=("$2") ;;
+                --library-path) LIBRARY_PATHS+=("$2") ;;
+            esac
+            shift 2
+            ;;
+        --resume)
+            if [[ $# -ge 2 && "$2" != -* ]]; then
+                RESUME="$2"
+                shift 2
+            else
+                RESUME="latest"
+                shift
+            fi
+            ;;
+        --device)
+            [[ $# -ge 2 && -n "$2" ]] || {
+                echo "Error: --device requires a path" >&2
+                exit 2
+            }
+            DEVICE_PATHS+=("$2")
+            shift 2
+            ;;
+        --dry-run)
+            DRY_RUN=1
+            shift
+            ;;
+        --)
+            shift
+            break
+            ;;
+        -*)
+            echo "Unknown option: $1" >&2
+            usage >&2
+            exit 2
+            ;;
+        *)
+            PROJECT="$1"
+            shift
+            break
+            ;;
+    esac
+done
+
+if [[ "${1:-}" == "--" ]]; then
+    shift
+fi
+
+PROJECT="$(realpath -e "${PROJECT:-.}")"
+if [[ ! -d "$PROJECT" || "$PROJECT" == "/" ]]; then
+    echo "Error: project must be a directory other than /: $PROJECT" >&2
+    exit 1
+fi
+
+for i in "${!RO_PATHS[@]}"; do
+    RO_PATHS[$i]="$(realpath -e "${RO_PATHS[$i]}")"
+    if [[ ! -d "${RO_PATHS[$i]}" || "${RO_PATHS[$i]}" == "/" ]]; then
+        echo "Error: read-only mount must be a directory other than /: ${RO_PATHS[$i]}" >&2
+        exit 1
+    fi
+    if [[ -n "${RO_TARGETS[$i]}" ]]; then
+        RO_TARGETS[$i]="$(realpath -m "${RO_TARGETS[$i]}")"
+    fi
+done
+
+for i in "${!RW_PATHS[@]}"; do
+    RW_PATHS[$i]="$(realpath -e "${RW_PATHS[$i]}")"
+    if [[ ! -d "${RW_PATHS[$i]}" || "${RW_PATHS[$i]}" == "/" ]]; then
+        echo "Error: read/write mount must be a directory other than /: ${RW_PATHS[$i]}" >&2
+        exit 1
+    fi
+    if [[ -n "${RW_TARGETS[$i]}" ]]; then
+        RW_TARGETS[$i]="$(realpath -m "${RW_TARGETS[$i]}")"
+    fi
+done
+
+RESERVED_MOUNTS=(/usr /bin /lib /lib64 /etc/hosts /etc/resolv.conf /etc/nsswitch.conf /etc/pki /etc/ssl /tmp /dev /proc /workspace /sandbox-config /opt/claude-code-bin /mnt/host-ro /mnt/host-rw)
+NAMED_TARGETS=()
+for target in "${RO_TARGETS[@]}" "${RW_TARGETS[@]}"; do
+    [[ -n "$target" ]] || continue
+    if [[ "$target" == "/" ]]; then
+        echo "Error: named mount destination must not be /" >&2
+        exit 1
+    fi
+    for reserved in "${RESERVED_MOUNTS[@]}"; do
+        if [[ "$target" == "$reserved" || "$target" == "$reserved/"* || "$reserved" == "$target/"* ]]; then
+            printf 'Error: named mount destination conflicts with built-in sandbox path %s: %s\n' "$reserved" "$target" >&2
+            exit 1
+        fi
+    done
+    for existing in "${NAMED_TARGETS[@]}"; do
+        if [[ "$target" == "$existing" ]]; then
+            printf 'Error: duplicate named mount destination: %s\n' "$target" >&2
+            exit 1
+        fi
+    done
+    NAMED_TARGETS+=("$target")
+done
+
+for path in "${EXTRA_PATHS[@]}" "${LIBRARY_PATHS[@]}"; do
+    if [[ "$path" != /* || "$path" == *:* ]]; then
+        printf 'Error: PATH entries must be absolute sandbox paths without colons: %s\n' "$path" >&2
+        exit 2
+    fi
+done
+
+if [[ -n "$PYTHON_ENV" ]]; then
+    PYTHON_ENV="$(realpath -e "$PYTHON_ENV")"
+    if [[ "$PYTHON_ENV" == "/" || ! -d "$PYTHON_ENV" || ! -x "$PYTHON_ENV/bin/python" ]]; then
+        echo "Error: Python environment must be a directory other than / containing an executable bin/python: $PYTHON_ENV" >&2
+        exit 1
+    fi
+fi
+
+for i in "${!DEVICE_PATHS[@]}"; do
+    DEVICE_PATHS[$i]="$(realpath -e "${DEVICE_PATHS[$i]}")"
+    if [[ "${DEVICE_PATHS[$i]}" != /dev/* ]] ||
+       [[ ! -c "${DEVICE_PATHS[$i]}" && ! -d "${DEVICE_PATHS[$i]}" ]]; then
+        echo "Error: device must be a character device or directory under /dev: ${DEVICE_PATHS[$i]}" >&2
+        exit 1
+    fi
+done
+
+if [[ -n "$CLAUDE_BIN" ]]; then
+    if [[ ! -x "$CLAUDE_BIN" ]]; then
+        echo "Error: Claude Code executable is not executable: $CLAUDE_BIN" >&2
+        exit 1
+    fi
+else
+    CLAUDE_BIN="$(command -v claude || true)"
+    if [[ -z "$CLAUDE_BIN" ]]; then
+        echo "Error: claude not found in PATH; install Claude Code or set SAFE_CLAUDECODE_BIN" >&2
+        exit 1
+    fi
+fi
+CLAUDE_BIN="$(readlink -f "$CLAUDE_BIN")"
+CLAUDE_DIR="$(dirname "$CLAUDE_BIN")"
+CLAUDE_NAME="$(basename "$CLAUDE_BIN")"
+
+if ! command -v "$BWRAP" >/dev/null 2>&1; then
+    echo "Error: Bubblewrap executable not found: $BWRAP" >&2
+    exit 1
+fi
+BWRAP="$(command -v "$BWRAP")"
+
+CONFIG="$(realpath -m "$CONFIG")"
+if [[ "$CONFIG" == "/" || "$CONFIG" == "$HOME" || "$HOME" == "$CONFIG/"* ]]; then
+    echo "Error: Claude Code config directory must not be /, the home directory, or one of its parents: $CONFIG" >&2
+    exit 1
+fi
+if [[ "$CONFIG" == "/home" || "$CONFIG" == "/root" ]]; then
+    echo "Error: Claude Code config directory must not be a shared home directory root: $CONFIG" >&2
+    exit 1
+fi
+if [[ "$CONFIG" == "$PROJECT" || "$PROJECT" == "$CONFIG/"* || "$CONFIG" == "$PROJECT/"* ]]; then
+    echo "Error: Claude Code config directory must be separate from the project directory: $CONFIG" >&2
+    exit 1
+fi
+for protected in /etc /usr /bin /sbin /lib /lib64 /var /opt /tmp /proc /sys /dev /boot; do
+    if [[ "$CONFIG" == "$protected" || "$CONFIG" == "$protected/"* ]]; then
+        printf 'Error: Claude Code config directory must not be under protected system path %s: %s\n' "$protected" "$CONFIG" >&2
+        exit 1
+    fi
+done
+mkdir -p "$CONFIG"
+
+ARGS=(
+    --die-with-parent
+    --new-session
+    --ro-bind /usr /usr
+    --ro-bind /bin /bin
+    --proc /proc
+    --dev /dev
+    --tmpfs /tmp
+    --dir /tmp/home
+    --dir /tmp/cache
+    --dir /etc
+)
+
+for dev in "${DEVICE_PATHS[@]}"; do
+    ARGS+=(--dev-bind "$dev" "$dev")
+done
+
+for d in /lib /lib64; do
+    if [[ -e "$d" ]]; then
+        ARGS+=(--ro-bind "$d" "$d")
+    fi
+done
+
+for f in /etc/hosts /etc/resolv.conf /etc/nsswitch.conf; do
+    if [[ -e "$f" ]]; then
+        ARGS+=(--ro-bind "$(readlink -f "$f")" "$f")
+    fi
+done
+
+for d in /etc/pki /etc/ssl; do
+    if [[ -d "$d" ]]; then
+        ARGS+=(--ro-bind "$d" "$d")
+    fi
+done
+
+ARGS+=(--dir /workspace)
+if [[ "$MODE" == "rw" ]]; then
+    ARGS+=(--bind "$PROJECT" /workspace)
+else
+    ARGS+=(--ro-bind "$PROJECT" /workspace)
+fi
+
+ARGS+=(
+    --dir /sandbox-config
+    --bind "$CONFIG" /sandbox-config/claude
+    --dir /opt
+    --ro-bind "$CLAUDE_DIR" /opt/claude-code-bin
+    --dir /mnt
+    --dir /mnt/host-ro
+    --dir /mnt/host-rw
+)
+DIRS_ADDED=(/tmp /tmp/home /tmp/cache /etc /workspace /sandbox-config /opt /mnt /mnt/host-ro /mnt/host-rw)
+
+ensure_parent_dirs() {
+    local path="$1"
+    local parent
+    local component
+    local known
+    local current=""
+    local -a components=()
+
+    parent="$(dirname "$path")"
+    IFS='/' read -r -a components <<< "$parent"
+    for component in "${components[@]}"; do
+        [[ -n "$component" ]] || continue
+        current+="/$component"
+        for known in "${DIRS_ADDED[@]}"; do
+            [[ "$current" == "$known" ]] && continue 2
+        done
+        ARGS+=(--dir "$current")
+        DIRS_ADDED+=("$current")
+    done
+}
+
+for i in "${!RO_PATHS[@]}"; do
+    target="${RO_TARGETS[$i]}"
+    if [[ -z "$target" ]]; then
+        target="/mnt/host-ro/$((i + 1))"
+    else
+        ensure_parent_dirs "$target"
+    fi
+    ARGS+=(--dir "$target" --ro-bind "${RO_PATHS[$i]}" "$target")
+    DIRS_ADDED+=("$target")
+done
+
+for i in "${!RW_PATHS[@]}"; do
+    target="${RW_TARGETS[$i]}"
+    if [[ -z "$target" ]]; then
+        target="/mnt/host-rw/$((i + 1))"
+    else
+        ensure_parent_dirs "$target"
+    fi
+    ARGS+=(--dir "$target" --bind "${RW_PATHS[$i]}" "$target")
+    DIRS_ADDED+=("$target")
+done
+
+PATH_VALUE="/opt/claude-code-bin:/usr/local/bin:/usr/bin:/bin"
+for path in "${EXTRA_PATHS[@]}"; do
+    PATH_VALUE="$path:$PATH_VALUE"
+done
+
+if [[ "${#LIBRARY_PATHS[@]}" -gt 0 ]]; then
+    LIBRARY_PATH_VALUE=""
+    for path in "${LIBRARY_PATHS[@]}"; do
+        LIBRARY_PATH_VALUE="${LIBRARY_PATH_VALUE:+$LIBRARY_PATH_VALUE:}$path"
+    done
+    ARGS+=(--setenv LD_LIBRARY_PATH "$LIBRARY_PATH_VALUE")
+fi
+
+if [[ -n "$PYTHON_ENV" ]]; then
+    ensure_parent_dirs "$PYTHON_ENV"
+    ARGS+=(--ro-bind "$PYTHON_ENV" "$PYTHON_ENV")
+    PATH_VALUE="$PYTHON_ENV/bin:$PATH_VALUE"
+    ARGS+=(--setenv VIRTUAL_ENV "$PYTHON_ENV")
+fi
+
+ARGS+=(
+    --setenv HOME /tmp/home
+    --setenv CLAUDE_CONFIG_DIR /sandbox-config/claude
+    --setenv XDG_CONFIG_HOME /sandbox-config
+    --setenv XDG_CACHE_HOME /tmp/cache
+    --setenv TMPDIR /tmp
+    --setenv PATH "$PATH_VALUE"
+    --chdir /workspace
+)
+
+CLAUDE_ARGS=()
+if [[ "$RESUME" == "latest" ]]; then
+    CLAUDE_ARGS+=(--continue)
+elif [[ -n "$RESUME" ]]; then
+    CLAUDE_ARGS+=(--resume "$RESUME")
+fi
+CLAUDE_ARGS+=("$@")
+
+echo "Project: $PROJECT ($MODE)"
+echo "Claude Code config: $CONFIG (read/write)"
+for i in "${!RO_PATHS[@]}"; do
+    target="${RO_TARGETS[$i]:-/mnt/host-ro/$((i + 1))}"
+    printf 'Read-only mount: %s -> %s\n' "${RO_PATHS[$i]}" "$target"
+done
+for i in "${!RW_PATHS[@]}"; do
+    target="${RW_TARGETS[$i]:-/mnt/host-rw/$((i + 1))}"
+    printf 'Read/write mount: %s -> %s\n' "${RW_PATHS[$i]}" "$target"
+done
+for path in "${EXTRA_PATHS[@]}"; do
+    printf 'PATH entry: %s\n' "$path"
+done
+for path in "${LIBRARY_PATHS[@]}"; do
+    printf 'Library path: %s\n' "$path"
+done
+for dev in "${DEVICE_PATHS[@]}"; do
+    printf 'Device: %s\n' "$dev"
+done
+if [[ -n "$PYTHON_ENV" ]]; then
+    echo "Python environment: $PYTHON_ENV (read-only)"
+fi
+echo "Resume: ${RESUME:-new session}"
+
+if [[ "$DRY_RUN" == 1 ]]; then
+    echo "Dry run: starting an interactive shell in the sandbox without starting Claude Code."
+    exec "$BWRAP" "${ARGS[@]}" /bin/bash --noprofile --norc -i
+else
+    echo "Starting Claude Code in the sandbox..."
+    exec "$BWRAP" "${ARGS[@]}" \
+        "/opt/claude-code-bin/$CLAUDE_NAME" \
+        "${CLAUDE_ARGS[@]}"
+fi

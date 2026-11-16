@@ -4,9 +4,8 @@
 limited access to the host filesystem, using
 [Bubblewrap](https://github.com/containers/bubblewrap) on Linux.
 
-The first committed launcher is **safe-opencode**, for OpenCode.
-Future launchers may support tools such as **Claude Code** and **Kimi Code**
-using a similar approach. These additional tools are not supported yet.
+The launchers include **safe-opencode**, for OpenCode, and
+**safe-claudecode**, for Claude Code.
 
 This may be useful on shared or managed cluster systems where Docker is disabled
 or unavailable, and where users have few other practical isolation tools. It
@@ -24,7 +23,8 @@ The launcher limits which host paths are visible to the tool and can make the
 project read-only by default. However, network access remains available in the
 host network namespace, and the level of isolation depends on the host kernel,
 Bubblewrap configuration, and local system policy. A writable mount gives the
-tool permission to change files in that mounted directory.
+tool permission to change files in that mounted directory. `--device` exposes
+the selected host device to the tool.
 
 Use only on systems and with data for which you are authorized. Do not mount
 credentials, broad home directories, or other sensitive paths. On clusters,
@@ -41,7 +41,7 @@ namespaces are supported.
 
 ## `safe-opencode`
 
-The first launcher targets OpenCode V2. It requires OpenCode available as
+`safe-opencode` targets OpenCode V2. It requires OpenCode available as
 `opencode` in the host `PATH`, or a native binary selected with
 `SAFE_OPENCODE_BIN`.
 
@@ -143,8 +143,8 @@ keep using `--standalone` explicitly.
 ### Usage
 
 By default, the project is mounted read-only at `/workspace`. OpenCode
-configuration is read-only, while OpenCode data is writable and persists on the
-host. The host home directory is not mounted.
+configuration and data are writable and persist on the host. The host home
+directory is not mounted.
 
 ```bash
 ./safe-opencode /path/to/project -- --standalone
@@ -163,12 +163,30 @@ OpenCode.
   /path/to/project -- --standalone
 ```
 
+GPU compute devices can be exposed individually. OpenCL setups may use `/dev/dri`;
+CUDA setups commonly need the NVIDIA device nodes present on the host:
+
+```bash
+./safe-opencode --device /dev/dri /path/to/project -- --standalone
+
+./safe-opencode \
+  --device /dev/nvidia0 \
+  --device /dev/nvidiactl \
+  --device /dev/nvidia-uvm \
+  /path/to/project -- --standalone
+```
+
 Mappings are numbered in the order supplied:
 
 - `--mount-ro PATH` → `/mnt/host-ro/N` (read-only)
 - `--mount-rw PATH` → `/mnt/host-rw/N` (read/write)
 - `--python-env PATH` → the same absolute path inside the sandbox (read-only,
   with its `bin` directory prepended to `PATH`)
+- `--device PATH` → the same path under `/dev` (device access)
+
+Device paths must resolve to a character device or directory under `/dev`.
+Check the device names and permissions on your system; exposing a device grants
+the sandbox access to it.
 
 The optional Python environment must contain an executable `bin/python`.
 Package installation into that environment will not work because it is mounted
@@ -180,6 +198,7 @@ into the sandbox may not work.
 - `--rw`: make the project mount writable.
 - `--mount-ro PATH`: expose an additional read-only directory.
 - `--mount-rw PATH`: expose an additional read/write directory.
+- `--device PATH`: expose a character device or directory under `/dev`.
 - `--python-env PATH`: expose a Python environment read-only.
 - `--config-dir PATH` / `--data-dir PATH`: override host OpenCode config/data
   directories.
@@ -201,6 +220,87 @@ opening prompt. For example:
 > read-only. Do not assume other host files or paths are available.
 
 This context is informational only; it is not automatically sent to the model.
+
+## `safe-claudecode`
+
+`safe-claudecode` runs Claude Code inside Bubblewrap. It requires the native
+Claude Code executable (`claude`) in `PATH`, or a native executable selected
+with `SAFE_CLAUDECODE_BIN`. The host home directory is not mounted. Claude Code
+configuration and authentication state are instead persisted in
+`$HOME/.claude`, mounted read/write in the sandbox.
+
+### Installation
+
+Install Bubblewrap separately through your system's package manager or ask your
+administrator to install it. Install Claude Code using Anthropic's recommended
+Linux native installer:
+
+```bash
+curl -fsSL https://claude.ai/install.sh | bash
+# Reopen your shell if needed to update PATH.
+claude --version
+```
+
+If `claude` is not found in `PATH`, or you want to select a specific native
+installation, set `SAFE_CLAUDECODE_BIN` to its executable path. The deprecated
+global npm installation is not recommended here.
+
+Start Claude Code from a project directory:
+
+```bash
+./safe-claudecode /path/to/project
+```
+
+The project is mounted read-only by default. Use `--rw` when Claude Code needs
+to edit project files:
+
+```bash
+./safe-claudecode --rw /path/to/project
+```
+
+The launcher sets `CLAUDE_CONFIG_DIR` to the mounted config directory so Claude
+Code's settings, sessions, and authentication state persist there. Sign in
+inside the sandbox on first use if needed. The config directory is writable by
+Claude Code and should be treated as sensitive. You can choose a separate
+directory with `--config-dir PATH` or `SAFE_CLAUDECODE_CONFIG`.
+
+Additional host directories can be exposed explicitly:
+
+```bash
+./safe-claudecode \
+  --mount-ro /data/reference \
+  --mount-rw /data/results \
+  --rw /path/to/project
+```
+
+Use `--device PATH` to expose an individual character device or directory from
+`/dev` inside the sandbox. For example, CUDA workloads commonly need several
+NVIDIA devices, while OpenCL setups may use `/dev/dri`:
+
+```bash
+./safe-claudecode --rw \
+  --device /dev/nvidia0 \
+  --device /dev/nvidiactl \
+  --device /dev/nvidia-uvm \
+  /path/to/project
+```
+
+Only devices or directories whose resolved host paths are under `/dev` are
+accepted. Check your system's device names and permissions; exposing a device
+grants the sandbox access to it.
+
+Mappings, `--path`, `--library-path`, `--device`, `--python-env`, `--bwrap`,
+`--resume`, and `--dry-run` work like their `safe-opencode` counterparts. Use
+`--` before Claude Code arguments when needed:
+
+```bash
+./safe-claudecode --rw /path/to/project -- --resume
+```
+
+The sandbox keeps outbound network access enabled for Claude Code and shares
+the host network namespace. A read/write project or mount lets Claude Code
+change those files. This is lightweight filesystem isolation, not a complete
+security boundary or protection for sensitive data.
 
 ## Limitations
 
