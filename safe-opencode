@@ -17,6 +17,7 @@ RO_TARGETS=()
 RW_TARGETS=()
 EXTRA_PATHS=()
 LIBRARY_PATHS=()
+DEVICE_PATHS=()
 DRY_RUN=0
 
 usage() {
@@ -30,6 +31,7 @@ Options:
   --mount-rw HOST_PATH[=SANDBOX_PATH] Add a read/write host directory at SANDBOX_PATH (default: /mnt/host-rw/N)
   --path PATH             Prepend a sandbox directory to PATH
   --library-path PATH     Prepend a sandbox directory to LD_LIBRARY_PATH
+  --device PATH           Expose a host device under /dev
   --python-env PATH       Expose a Python environment read-only
   --config-dir PATH       Use a different host OpenCode config directory
   --data-dir PATH         Use a different host OpenCode data directory
@@ -107,6 +109,14 @@ while [[ $# -gt 0 ]]; do
                 --path) EXTRA_PATHS+=("$2") ;;
                 --library-path) LIBRARY_PATHS+=("$2") ;;
             esac
+            shift 2
+            ;;
+        --device)
+            [[ $# -ge 2 && -n "$2" ]] || {
+                echo "Error: --device requires a path" >&2
+                exit 2
+            }
+            DEVICE_PATHS+=("$2")
             shift 2
             ;;
         --no-service-check)
@@ -214,6 +224,15 @@ if [[ -n "$PYTHON_ENV" ]]; then
     fi
 fi
 
+for i in "${!DEVICE_PATHS[@]}"; do
+    DEVICE_PATHS[$i]="$(realpath -e "${DEVICE_PATHS[$i]}")"
+    if [[ "${DEVICE_PATHS[$i]}" != /dev/* ]] ||
+       [[ ! -c "${DEVICE_PATHS[$i]}" && ! -d "${DEVICE_PATHS[$i]}" ]]; then
+        echo "Error: device must be a character device or directory under /dev: ${DEVICE_PATHS[$i]}" >&2
+        exit 1
+    fi
+done
+
 OPENCODE="$(command -v opencode || true)"
 if [[ -z "$OPENCODE" ]]; then
     echo "Error: opencode not found in PATH" >&2
@@ -272,6 +291,10 @@ ARGS=(
     --dir /tmp/cache
     --dir /etc
 )
+
+for dev in "${DEVICE_PATHS[@]}"; do
+    ARGS+=(--dev-bind "$dev" "$dev")
+done
 
 for d in /lib /lib64; do
     if [[ -e "$d" ]]; then
@@ -430,6 +453,9 @@ done
 if [[ -n "$PYTHON_ENV" ]]; then
     echo "Python environment: $PYTHON_ENV (read-only)"
 fi
+for dev in "${DEVICE_PATHS[@]}"; do
+    printf 'Device: %s\n' "$dev"
+done
 echo "Resume: ${RESUME:-new session}"
 
 print_prompt_context() {
