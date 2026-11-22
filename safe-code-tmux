@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+
+run_with_tmux() {
+    local bwrap="$1"
+    shift
+    local runtime="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+    local root="$runtime/safe-code-audit"
+    local audit="$root/$TMUX_ID"
+    local socket="$audit/tmux.sock"
+    local uid mode status tmux
+    uid="$(id -u)"
+
+    if ! tmux="$(command -v tmux)"; then
+        echo "Error: --tmux requires tmux in PATH" >&2
+        return 1
+    fi
+    tmux="$(readlink -f -- "$tmux")"
+    if [[ ! -f "$tmux" || ! -x "$tmux" ]]; then
+        printf 'Error: tmux is not an executable file: %s\n' "$tmux" >&2
+        return 1
+    fi
+    if [[ "$runtime" != /* || ! -d "$runtime" || -L "$runtime" || "$(stat -c %u -- "$runtime")" != "$uid" ]]; then
+        printf 'Error: runtime directory must be an absolute, non-symlink directory owned by the current user: %s\n' "$runtime" >&2
+        return 1
+    fi
+    mode="$(stat -c %a -- "$runtime")"
+    if (( (8#$mode & 077) != 0 )); then
+        printf 'Error: runtime directory must not be accessible to other users: %s\n' "$runtime" >&2
+        return 1
+    fi
+    if [[ "$(printf %s "$socket" | wc -c)" -gt 107 ]]; then
+        echo "Error: tmux socket path exceeds the Unix socket path limit" >&2
+        return 1
+    fi
+    if [[ ! -e "$root" && ! -L "$root" ]]; then
+        mkdir -m 700 -- "$root" || return 1
+    fi
+    if [[ ! -d "$root" || -L "$root" || "$(stat -c %u -- "$root")" != "$uid" ]]; then
+        printf 'Error: audit directory must be a non-symlink directory owned by the current user: %s\n' "$root" >&2
+        return 1
+    fi
+    mode="$(stat -c %a -- "$root")"
+    if (( (8#$mode & 077) != 0 )); then
+        printf 'Error: audit directory must not be accessible to other users: %s\n' "$root" >&2
+        return 1
+    fi
+    if ! mkdir -m 700 -- "$audit"; then
+        printf 'Error: cannot create audit directory (audit ID may already be in use): %s\n' "$audit" >&2
+        return 1
+    fi
+
+    printf 'Control shell: tmux -S %q attach-session\n' "$socket"
+    printf 'The agent can access the control socket; keep the original terminal open.\n'
+
+    if "$bwrap" "${ARGS[@]}" \
+        --dir /run --bind "$audit" /run/safe-code-audit \
+        --ro-bind "$tmux" /opt/safe-code-tmux \
+        /bin/bash -c '
+            socket=/run/safe-code-audit/tmux.sock
+            if ! env -u TMUX /opt/safe-code-tmux -f /dev/null -S "$socket" \
+                new-session -d -s control -c /workspace /bin/bash --noprofile --norc -i; then
+                echo "Error: failed to start the tmux control session" >&2
+                exit 1
+            fi
+            if "$@"; then status=0; else status=$?; fi
+            echo "Agent exited; waiting for all tmux sessions to end."
+            while env -u TMUX /opt/safe-code-tmux -S "$socket" list-sessions >/dev/null 2>&1; do
+                sleep 1
+            done
+            echo "Tmux server ended or became unavailable."
+            exit "$status"
+        ' safe-code-tmux "$@"; then
+        status=0
+    else
+        status=$?
+    fi
+
+    if [[ -S "$socket" ]] && env -u TMUX "$tmux" -S "$socket" list-sessions >/dev/null 2>&1; then
+        printf 'Warning: tmux server is still running; leaving its socket at %s\n' "$socket" >&2
+    else
+        if [[ -S "$socket" ]]; then
+            rm -- "$socket"
+        fi
+        if ! rmdir -- "$audit"; then
+            printf 'Warning: could not remove audit directory: %s\n' "$audit" >&2
+        fi
+    fi
+    return "$status"
+}

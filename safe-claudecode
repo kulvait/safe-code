@@ -19,6 +19,7 @@ LINK_PATHS=()
 LINK_TARGETS=()
 LINK_MODES=()
 DRY_RUN=0
+TMUX_ID=""
 
 usage() {
     cat <<'EOF'
@@ -39,6 +40,7 @@ Options:
   --bwrap PATH            Use a specific Bubblewrap executable
   --resume                Continue the most recent session
   --resume ID             Resume a specific session
+  --tmux AUDIT_ID         Start a separate tmux control shell in the sandbox
   --dry-run               Open an interactive shell in the sandbox without starting Claude Code
   --help, -h              Show this help
 
@@ -96,7 +98,7 @@ while [[ $# -gt 0 ]]; do
             LINK_TARGETS+=("$3")
             shift 3
             ;;
-        --mount-ro|--mount-rw|--python-env|--config-dir|--bwrap|--path|--library-path)
+        --mount-ro|--mount-rw|--python-env|--config-dir|--bwrap|--path|--library-path|--tmux)
             option="$1"
             [[ $# -ge 2 && -n "$2" ]] || {
                 echo "Error: $option requires a path" >&2
@@ -118,6 +120,7 @@ while [[ $# -gt 0 ]]; do
                 --bwrap) BWRAP="$2" ;;
                 --path) EXTRA_PATHS+=("$2") ;;
                 --library-path) LIBRARY_PATHS+=("$2") ;;
+                --tmux) TMUX_ID="$2" ;;
             esac
             shift 2
             ;;
@@ -161,6 +164,17 @@ done
 
 if [[ "${1:-}" == "--" ]]; then
     shift
+fi
+
+if [[ -n "$TMUX_ID" ]]; then
+    if [[ ! "$TMUX_ID" =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$ ]]; then
+        echo "Error: tmux audit ID must contain only letters, digits, underscores or hyphens and start with a letter or digit" >&2
+        exit 2
+    fi
+    if [[ "$DRY_RUN" == 1 ]]; then
+        echo "Error: --tmux cannot be combined with --dry-run" >&2
+        exit 2
+    fi
 fi
 
 PROJECT="$(realpath -e "${PROJECT:-.}")"
@@ -309,6 +323,9 @@ for i in "${!RW_PATHS[@]}"; do
 done
 
 RESERVED_MOUNTS=(/usr /bin /lib /lib64 /etc/hosts /etc/resolv.conf /etc/nsswitch.conf /etc/pki /etc/ssl /tmp /dev /proc /workspace /sandbox-config /opt/claude-code-bin /mnt/host-ro /mnt/host-rw)
+if [[ -n "$TMUX_ID" ]]; then
+    RESERVED_MOUNTS+=(/run/safe-code-audit /opt/safe-code-tmux)
+fi
 NAMED_TARGETS=()
 for target in "${RO_TARGETS[@]}" "${RW_TARGETS[@]}"; do
     [[ -n "$target" ]] || continue
@@ -573,7 +590,11 @@ if [[ "$DRY_RUN" == 1 ]]; then
     exec "$BWRAP" "${ARGS[@]}" /bin/bash --noprofile --norc -i
 else
     echo "Starting Claude Code in the sandbox..."
-    exec "$BWRAP" "${ARGS[@]}" \
-        "/opt/claude-code-bin/$CLAUDE_NAME" \
-        "${CLAUDE_ARGS[@]}"
+    if [[ -z "$TMUX_ID" ]]; then
+        exec "$BWRAP" "${ARGS[@]}" \
+            "/opt/claude-code-bin/$CLAUDE_NAME" \
+            "${CLAUDE_ARGS[@]}"
+    fi
+    source "$(dirname -- "$(realpath -e -- "${BASH_SOURCE[0]}")")/safe-code-tmux"
+    run_with_tmux "$BWRAP" "/opt/claude-code-bin/$CLAUDE_NAME" "${CLAUDE_ARGS[@]}"
 fi
